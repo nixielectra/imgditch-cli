@@ -1,0 +1,88 @@
+name: Build Binaries
+
+on:
+  push:
+    tags:
+      - "v*"          # trigger on version tags: v1.0, v1.2.3, etc.
+  workflow_dispatch:  # allow manual runs from GitHub UI
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest   # host runner
+            container: ubuntu:20.04
+            name: linux-x86_64-py-3.8
+
+          - os: ubuntu-latest
+            name: linux-x86_64-py-3.13
+
+          - os: macos-15
+            name: macos-arm64
+
+    runs-on: ${{ matrix.os }}
+
+    container: ${{ matrix.container || '' }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Install system deps (container only)
+        if: matrix.container
+        run: |
+          apt-get update
+          apt-get install -y python3 python3-pip
+
+      - name: Set up Python
+        if: ${{ !matrix.container }}
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: |
+          python3 -m pip install --upgrade pip
+          pip3 install requests pyinstaller
+
+      - name: Build binary
+        run: |
+          pyinstaller \
+            --onefile \
+            --name fileditch \
+            --strip \
+            --noupx \
+            downloader.py
+
+      - name: Rename binary with platform suffix
+        run: |
+          mv dist/fileditch dist/fileditch-${{ matrix.name }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: fileditch-${{ matrix.name }}
+          path: dist/fileditch-${{ matrix.name }}
+          retention-days: 1
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: dist/*
+          generate_release_notes: false
