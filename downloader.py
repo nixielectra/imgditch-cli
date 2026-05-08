@@ -316,7 +316,14 @@ def fast_download(cdn_url: str, output_path: str,
 
 # ── Public entry points ───────────────────────────────────────────────────────
 
-def download_file(url: str, output_path: Optional[str] = None,
+def resolve_output_path(output_dir: "str | None", filename: str) -> str:
+    """If output_dir given, create it and join with filename. Else use cwd."""
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+        return os.path.join(output_dir, filename)
+    return filename
+
+def download_file(url: str, output_dir: Optional[str] = None,
                   threads: int = DEFAULT_THREADS,
                   timeout: int = 60,
                   retries: int = 3,
@@ -326,7 +333,7 @@ def download_file(url: str, output_path: Optional[str] = None,
 
     if "file.php" not in parsed.path:
         # Direct CDN link
-        fname = output_path or get_filename(url)
+        fname = resolve_output_path(output_dir, get_filename(url))
         return fast_download(url, fname, threads=threads,
                              timeout=timeout, retries=retries, debug=debug)
 
@@ -334,7 +341,7 @@ def download_file(url: str, output_path: Optional[str] = None,
     if not cdn_url:
         return ""
 
-    fname = output_path or get_filename(cdn_url, original_url=url)
+    fname = resolve_output_path(output_dir, get_filename(cdn_url, original_url=url))
     return fast_download(cdn_url, fname, original_url=url,
                          threads=threads, timeout=timeout,
                          retries=retries, debug=debug)
@@ -351,8 +358,7 @@ def batch_download(file_path: str, output_dir: str = ".",
     success = failed = 0
     for i, url in enumerate(urls, 1):
         print(f"\n--- [{i}/{len(urls)}] ---")
-        out = os.path.join(output_dir, get_filename(url))
-        result = download_file(url, output_path=out, threads=threads, debug=debug)
+        result = download_file(url, output_dir=output_dir, threads=threads, debug=debug)
         (success if result else failed).__class__  # dummy
         if result:
             success += 1
@@ -371,7 +377,7 @@ def main():
         epilog=__doc__,
     )
     parser.add_argument("input", help="URL or .txt file (--batch)")
-    parser.add_argument("-o", "--output", help="Output filename")
+    parser.add_argument("-o", "--output", metavar="DIR", help="Directory to save file into (created if missing)")
     parser.add_argument("-d", "--dir", default=".", help="Output dir (batch mode)")
     parser.add_argument("-t", "--threads", type=int, default=DEFAULT_THREADS,
                         help=f"Parallel threads (default: {DEFAULT_THREADS})")
@@ -388,7 +394,7 @@ def main():
         batch_download(args.input, output_dir=args.dir,
                        threads=args.threads, debug=args.debug)
     else:
-        download_file(args.input, output_path=args.output,
+        download_file(args.input, output_dir=args.output,
                       threads=args.threads, timeout=args.timeout,
                       retries=args.retries, debug=args.debug)
 
