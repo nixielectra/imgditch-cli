@@ -18,7 +18,6 @@ import re
 import sys
 import time
 import threading
-import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -182,10 +181,10 @@ def probe(url: str, debug: bool = False) -> Tuple[int, bool]:
 
 # ── Chunk download → temp file ────────────────────────────────────────────────
 
-def download_chunk_to_file(url: str, start: int, end: int,
-                           tmp_path: str, progress: Progress,
-                           retries: int = 3) -> str:
-    """Download bytes[start-end] directly to a temp file. Returns tmp_path."""
+def download_chunk_direct(url: str, start: int, end: int,
+                          filename: str, progress: Progress,
+                          retries: int = 3) -> None:
+    """Download bytes[start-end] and write directly to the correct offset in filename."""
     headers = {**DOWNLOAD_HEADERS, "Range": f"bytes={start}-{end}"}
     for attempt in range(retries):
         this_attempt = 0
@@ -193,36 +192,19 @@ def download_chunk_to_file(url: str, start: int, end: int,
             r = requests.get(url, headers=headers, stream=True, timeout=60)
             if r.status_code not in (200, 206):
                 raise RuntimeError(f"HTTP {r.status_code}")
-            with open(tmp_path, "wb") as f:
+            with open(filename, "r+b") as f:
+                f.seek(start)
                 for chunk in r.iter_content(chunk_size=READ_SIZE):
                     if chunk:
                         f.write(chunk)
                         progress.add(len(chunk))
                         this_attempt += len(chunk)
-            return tmp_path
+            return
         except Exception as e:
-            # Subtract bytes already counted for this failed attempt
             progress.add(-this_attempt)
             if attempt == retries - 1:
                 raise RuntimeError(f"Chunk {start}-{end} failed: {e}")
             time.sleep(2 ** attempt)
-    return tmp_path
-
-
-# ── Assemble temp files ───────────────────────────────────────────────────────
-
-def assemble(tmp_files: List[str], output: str):
-    print(f"  Assembling {len(tmp_files)} parts...")
-    with open(output, "wb") as out:
-        for path in tmp_files:
-            with open(path, "rb") as f:
-                while True:
-                    buf = f.read(4 * 1024 * 1024)  # 4 MB copy buffer
-                    if not buf:
-                        break
-                    out.write(buf)
-            os.remove(path)
-
 
 # ── Main download logic ───────────────────────────────────────────────────────
 
@@ -242,68 +224,59 @@ def fast_download(cdn_url: str, output_path: str,
     print(f"  File: {filename}  |  Size: {size_str}  |  Range support: {accepts_ranges}")
 
     progress = Progress(total)
-    tmp_dir = tempfile.mkdtemp(prefix="fileditch_")
 
-    try:
-        if accepts_ranges and total > 0 and threads > 1:
-            # ── Parallel ──────────────────────────────────────────────────
-            min_chunk = 256 * 1024 * 1024  # 256 MB — fewer, larger sequential chunks
-            part_size = max(total // threads, min_chunk)
-            ranges = []
-            start = 0
-            while start < total:
-                end = min(start + part_size - 1, total - 1)
-                ranges.append((start, end))
-                start = end + 1
+    if accepts_ranges and total > 0 and threads > 1:
+        # Pre-allocate the file so all threads can seek+write concurrently
+        with open(filename, "wb") as f:
+            f.seek(total - 1)
+            f.write(b"\x00")
 
-            n = len(ranges)
-            print(f"  {n} chunks × {part_size/1024/1024:.1f} MB  |  {threads} threads\n")
+        min_chunk = 4 * 1024 * 1024   # 4 MB minimum per chunk
+        part_size = max(total // threads, min_chunk)
+        ranges = []
+        start = 0
+        while start < total:
+            end = min(start + part_size - 1, total - 1)
+            ranges.append((start, end))
+            start = end + 1
 
-            tmp_files = [os.path.join(tmp_dir, f"part_{i:04d}") for i in range(n)]
-            failed = False
+        n = len(ranges)
+        print(f"  {n} chunks x {part_size/1024/1024:.1f} MB  |  {threads} threads\n")
 
-            with ThreadPoolExecutor(max_workers=threads) as ex:
-                futures = {
-                    ex.submit(download_chunk_to_file, cdn_url, s, e,
-                              tmp_files[i], progress, retries): i
-                    for i, (s, e) in enumerate(ranges)
-                }
-                for fut in as_completed(futures):
-                    idx = futures[fut]
-                    try:
-                        fut.result()
-                    except Exception as err:
-                        print(f"\n  [!] Chunk {idx} failed: {err}")
-                        failed = True
+        failed = False
+        with ThreadPoolExecutor(max_workers=threads) as ex:
+            futures = {
+                ex.submit(download_chunk_direct, cdn_url, s, e,
+                          filename, progress, retries): i
+                for i, (s, e) in enumerate(ranges)
+            }
+            for fut in as_completed(futures):
+                idx = futures[fut]
+                try:
+                    fut.result()
+                except Exception as err:
+                    print(f"\n  [!] Chunk {idx} failed: {err}")
+                    failed = True
 
-            progress.done()
+        progress.done()
 
-            if failed:
-                print("[!] Some chunks failed. Try again or reduce --threads.")
-                return ""
+        if failed:
+            print("[!] Some chunks failed. Try again or reduce --threads.")
+            return ""
 
-            assemble(tmp_files, filename)
-
-        else:
-            # ── Single-thread fallback ────────────────────────────────────
-            reason = "no Range support" if not accepts_ranges else "unknown size"
-            print(f"  Single-thread streaming ({reason})...\n")
-            with requests.get(cdn_url, headers=DOWNLOAD_HEADERS,
-                              stream=True, timeout=timeout) as r:
-                r.raise_for_status()
-                with open(filename, "wb") as f:
-                    for chunk in r.iter_content(chunk_size=READ_SIZE):
-                        if chunk:
-                            f.write(chunk)
-                            progress.add(len(chunk))
-            progress.done()
-    finally:
-        # Clean up temp dir even on error
-        try:
-            import shutil
-            shutil.rmtree(tmp_dir, ignore_errors=True)
-        except Exception:
-            pass
+    else:
+        # Single-thread fallback
+        reason = "no Range support" if not accepts_ranges else "unknown size"
+        print(f"  Single-thread streaming ({reason})...\n")
+        with requests.get(cdn_url, headers=DOWNLOAD_HEADERS,
+                          stream=True, timeout=timeout) as r:
+            r.raise_for_status()
+            with open(filename, "wb") as f:
+                for chunk in r.iter_content(chunk_size=READ_SIZE):
+                    if chunk:
+                        f.write(chunk)
+                        progress.add(len(chunk))
+        progress.done()
 
     saved = os.path.getsize(filename) if os.path.exists(filename) else 0
     if saved == 0:
