@@ -48,7 +48,7 @@ DOWNLOAD_HEADERS = {
 }
 
 CDN_PATTERN = re.compile(
-    r'https?://[\w\-]+\.(?:thegumonmyshoe\.me|fileditchfiles\.me)'
+    r'https?://[\w\-]+\.(?:thegumonmyshoe\.me|fileditchfiles\.me|donotsharethesetemplinksyouidiot\.st)'
     r'/[^\s"\'<>]+\?[^\s"\'<>]*(?:md5|expires)=[^\s"\'<>]+',
     re.IGNORECASE,
 )
